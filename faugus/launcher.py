@@ -24,7 +24,7 @@ from faugus.migration import fix_legacy_shortcut_icons
 from faugus.main_screen_nav import adjust_widget_value, carrousel_move_coalesced, focus_bottom_bar_by_column, focus_flowbox_child, focus_top_bar, navigate_focus
 from faugus.tray_only import spawn as tray_only_spawn
 
-VERSION = "2.5.6"
+VERSION = "2.5.7"
 
 GLib.set_prgname(APP_ID)
 
@@ -2002,6 +2002,10 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             self.layout_carrousel_slot(slot, slot.get("visual_offset", slot["offset"]))
 
     def layout_carrousel_slot(self, slot, offset):
+        if getattr(slot["box"], "game", None) is None:
+            slot["box"].set_opacity(0.0)
+            return
+
         scale, opacity = self.carrousel_scale_opacity(offset)
         radius = getattr(self, 'carrousel_radius', 3)
         d = abs(offset)
@@ -2138,6 +2142,8 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 slot["style_provider"].load_from_data(
                     b"entry.flowbox-entry.cover-container.carrousel-cover-box { transition: none; box-shadow: none; }"
                 )
+            self.schedule_background_update()
+            self.update_icon()
             return
 
         self.carrousel_index %= n
@@ -2281,6 +2287,10 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         return navigate_focus(direction)
 
     def on_search_entry_key(self, controller, keyval, keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            self.leave_search()
+            return True
+
         if keyval not in (Gdk.KEY_Left, Gdk.KEY_Right):
             return False
 
@@ -3878,7 +3888,22 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
     def on_item_double_click(self, item):
         self.play_or_notify(self.selected())
 
+    def leave_search(self):
+        game = self.selected()
+        self.entry_search.set_text("")
+        if getattr(self, '_carrousel_search_source', None):
+            GLib.source_remove(self._carrousel_search_source)
+            self._carrousel_search_source = None
+        if game:
+            self.select_game_by_title(game.title)
+        else:
+            self.select_first_child()
+
     def on_key_press_event(self, controller, keyval, keycode, state):
+        if keyval == Gdk.KEY_f and state & Gdk.ModifierType.CONTROL_MASK:
+            self.entry_search.grab_focus()
+            return True
+
         if keyval == Gdk.KEY_h and state & Gdk.ModifierType.CONTROL_MASK:
             try:
                 config = ConfigManager()
@@ -4341,6 +4366,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self.flowbox.invalidate_filter()
 
         self.select_first_visible_child()
+        self.update_overview_panel()
 
     def on_search_activate(self, entry):
         game = self.selected()
@@ -4514,14 +4540,19 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         game_directory = os.path.dirname(expand_path(game.path))
         cwd = game_directory if game_directory and os.path.isdir(game_directory) else None
 
-        cmd = [sys.executable, "-m", "faugus.runner", "--game", gameid]
+        if APPIMAGE_PATH:
+            cmd = [APPIMAGE_PATH, "--game", gameid]
+            run_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        else:
+            cmd = [sys.executable, "-m", "faugus.runner", "--game", gameid]
+            run_env = subprocess_env()
         if with_logs:
             cmd.append("--logs")
 
         if game.runner == "Steam":
             self.update_last_played(gameid)
             self.sync_last_played_order(gameid)
-            subprocess.Popen(cmd, cwd=cwd, env=subprocess_env())
+            subprocess.Popen(cmd, cwd=cwd, env=run_env)
             return
 
         if gameid in self.running:
@@ -4534,7 +4565,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             self.update_icon()
             return
 
-        proc = subprocess.Popen(cmd, cwd=cwd, env=subprocess_env())
+        proc = subprocess.Popen(cmd, cwd=cwd, env=run_env)
 
         if not IS_FLATPAK or not self.auto_close_on_launch:
             self.running[gameid] = proc.pid
@@ -4707,6 +4738,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             if not edit_game_dialog.combobox_runner.set_active_id(game_runner):
                 edit_game_dialog.combobox_runner.set_active(0)
         edit_game_dialog.set_title_silently(game.title)
+        edit_game_dialog._artwork_title = game.title
         edit_game_dialog._steamgriddb_suggestion_id = getattr(game, "steamgriddb_id", "") or None
         edit_game_dialog._steamgriddb_steam_appid = game.path if game_runner == "Steam" else None
         edit_game_dialog.entry_path.set_text(game.path)
@@ -5465,7 +5497,8 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
 
         game_directory = os.path.dirname(expand_path(game.path))
         desktop_file_content = build_desktop_file_content(
-            game.title, f'--game {game.gameid}', new_icon_path, game_directory
+            game.title, f'--game {game.gameid}', new_icon_path, game_directory,
+            game_wm_class({"gameid": game.gameid, "runner": game.runner, "launch_arguments": game.launch_arguments})
         )
 
         os.makedirs(APP_DIR, exist_ok=True)
@@ -7718,39 +7751,8 @@ class AddGame(Gtk.Dialog, HiDpiMixin, HookEntriesMixin, LaunchArgumentsMixin, Ad
         self._virtual_keyboard_active_for_title = False
 
         if self.steamgriddb_enabled:
-            self.popover_suggestion = Gtk.Popover()
-            self.popover_suggestion.set_has_arrow(False)
-            self.popover_suggestion.set_autohide(False)
-            self.popover_suggestion.add_css_class("suggestion-popover")
-            self.popover_suggestion.set_parent(self.entry_title)
-
-            self.listbox_suggestion = Gtk.ListBox()
-            self.listbox_suggestion.set_selection_mode(Gtk.SelectionMode.NONE)
-            self.listbox_suggestion.connect("row-activated", self.on_suggestion_row_activated)
-
-            suggestion_scroll = Gtk.ScrolledWindow()
-            suggestion_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-            suggestion_scroll.set_max_content_height(250)
-            suggestion_scroll.set_propagate_natural_height(True)
-            suggestion_scroll.set_size_request(300, -1)
-            suggestion_scroll.set_child(self.listbox_suggestion)
-
-            self.popover_suggestion.set_child(suggestion_scroll)
-
+            self.popover_suggestion = create_suggestion_popover(self.entry_title, self, self.on_title_suggestion_picked)
             self.entry_title.connect("changed", self.on_title_changed_for_suggestions)
-
-            title_key_controller = Gtk.EventControllerKey()
-            title_key_controller.connect("key-pressed", self.on_title_key_pressed)
-            self.entry_title.add_controller(title_key_controller)
-
-            title_suggestion_focus_controller = Gtk.EventControllerFocus()
-            title_suggestion_focus_controller.connect("leave", lambda c: self.on_title_focus_leave_for_suggestions())
-            self.entry_title.add_controller(title_suggestion_focus_controller)
-
-            suggestion_click_outside_controller = Gtk.GestureClick()
-            suggestion_click_outside_controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-            suggestion_click_outside_controller.connect("pressed", self.on_dialog_click_for_suggestions)
-            self.add_controller(suggestion_click_outside_controller)
 
         self.label_path = Gtk.Label(label=_("Path"))
         self.label_path.set_halign(Gtk.Align.START)
@@ -8602,10 +8604,10 @@ class AddGame(Gtk.Dialog, HiDpiMixin, HookEntriesMixin, LaunchArgumentsMixin, Ad
 
                 api_url = f"https://steamgrid.usebottles.com/api/search/{game_name}"
                 try:
-                    response = requests.get(api_url)
+                    response = requests.get(api_url, timeout=15)
                     response.raise_for_status()
                     image_url = response.text.strip('"')
-                    content = verified_content(requests.get(image_url))
+                    content = verified_content(requests.get(image_url, timeout=15))
                     idle_add_while_open(closed_event, self.apply_downloaded_artwork, "cover", content)
 
                 except requests.RequestException as e:
@@ -8665,42 +8667,6 @@ class AddGame(Gtk.Dialog, HiDpiMixin, HookEntriesMixin, LaunchArgumentsMixin, Ad
                 os.remove(self.cover_path_temp)
             self.update_image_cover()
 
-    def on_title_key_pressed(self, controller, keyval, keycode, state):
-        if keyval == Gdk.KEY_Escape and self.popover_suggestion.get_visible():
-            self.popover_suggestion.popdown()
-            return True
-        return False
-
-    def on_title_focus_leave_for_suggestions(self):
-        closed_event = self.closed_event
-        entry_title = self.entry_title
-
-        def check():
-            if closed_event.is_set():
-                return False
-            root = entry_title.get_root()
-            w = root.get_focus() if root else None
-            while w is not None:
-                if w is self.popover_suggestion:
-                    return False
-                w = w.get_parent()
-            self.popover_suggestion.popdown()
-            return False
-
-        GLib.idle_add(check)
-
-    def on_dialog_click_for_suggestions(self, gesture, n_press, x, y):
-        if not self.popover_suggestion.get_visible():
-            return
-
-        w = self.pick(x, y, Gtk.PickFlags.DEFAULT)
-        while w is not None:
-            if w is self.popover_suggestion or w is self.entry_title:
-                return
-            w = w.get_parent()
-
-        self.popover_suggestion.popdown()
-
     def on_title_changed_for_suggestions(self, entry):
         if self._suggestion_programmatic or self._virtual_keyboard_active_for_title:
             return
@@ -8746,30 +8712,7 @@ class AddGame(Gtk.Dialog, HiDpiMixin, HookEntriesMixin, LaunchArgumentsMixin, Ad
         if self.entry_title.get_text().strip() != term:
             return
 
-        child = self.listbox_suggestion.get_first_child()
-        while child:
-            nxt = child.get_next_sibling()
-            self.listbox_suggestion.remove(child)
-            child = nxt
-
-        if not suggestions:
-            self.popover_suggestion.popdown()
-            return
-
-        for item in suggestions:
-            row = Gtk.ListBoxRow()
-            label = Gtk.Label(label=item["name"])
-            label.set_halign(Gtk.Align.START)
-            label.set_margin_start(8)
-            label.set_margin_end(8)
-            label.set_margin_top(6)
-            label.set_margin_bottom(6)
-            row.set_child(label)
-            row.steamgriddb_id = item["id"]
-            row.steamgriddb_name = item["name"]
-            self.listbox_suggestion.append(row)
-
-        self.popover_suggestion.popup()
+        self.popover_suggestion.populate(suggestions)
 
     def set_title_silently(self, text):
         self._suggestion_programmatic = True
@@ -8780,8 +8723,8 @@ class AddGame(Gtk.Dialog, HiDpiMixin, HookEntriesMixin, LaunchArgumentsMixin, Ad
         self.set_title_silently(re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip())
         self._steamgriddb_suggestion_id = game_id
 
-    def on_suggestion_row_activated(self, listbox, row):
-        self.apply_title_suggestion(row.steamgriddb_name, row.steamgriddb_id)
+    def on_title_suggestion_picked(self, item):
+        self.apply_title_suggestion(item["name"], item["id"])
         self.popover_suggestion.popdown()
         self.entry_title.grab_focus_without_selecting()
         self.get_artwork()
@@ -9332,7 +9275,7 @@ class AddGame(Gtk.Dialog, HiDpiMixin, HookEntriesMixin, LaunchArgumentsMixin, Ad
         return True
 
 
-def build_desktop_file_content(title, exec_args, icon_path, working_directory):
+def build_desktop_file_content(title, exec_args, icon_path, working_directory, wm_class=None):
     if IS_FLATPAK:
         exec_line = f'Exec=flatpak run --command={LAUNCHER_PATH} io.github.Faugus.faugus-launcher {LAUNCHER_MODULE_ARGS}{exec_args}\n'
     else:
@@ -9346,6 +9289,7 @@ def build_desktop_file_content(title, exec_args, icon_path, working_directory):
         f'Type=Application\n'
         f'Categories=Game;\n'
         f'Path={working_directory}\n'
+        + (f'StartupWMClass={wm_class}\n' if wm_class else '')
     )
 
 
