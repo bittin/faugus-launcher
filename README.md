@@ -31,7 +31,7 @@ sudo dpkg --add-architecture i386
 sudo apt update
 sudo apt install -y wget
 mkdir -p ~/faugus-launcher
-wget -P ~/faugus-launcher https://github.com/Faugus/faugus-launcher/releases/download/2.5.7/faugus-launcher_2.5.7-1_all.deb
+wget -P ~/faugus-launcher https://github.com/Faugus/faugus-launcher/releases/download/2.5.9/faugus-launcher_2.5.9-1_all.deb
 sudo apt install -y ~/faugus-launcher/*.deb
 sudo rm -r ~/faugus-launcher
 ```
@@ -106,6 +106,9 @@ Native only.
 ```
 /usr/share/themes
 ```
+
+### GitHub API limit
+The Proton Manager and the "Latest" runners look up releases through the GitHub API, which allows 60 requests an hour without a token. Set `GITHUB_TOKEN` in the environment Faugus starts with (not in Global Environment Variables) to a GitHub access token to raise this to 5,000 an hour. A fine-grained token with no permissions is enough.
 
 ### Gamepad mapping
 | Action        | Playstation | Xbox     |

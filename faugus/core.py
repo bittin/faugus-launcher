@@ -6,10 +6,18 @@ import shlex
 import signal
 import subprocess
 import tempfile
+import urllib.parse
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 from faugus.path_manager import COMPATIBILITY_DIRS, COVERS_DIR, FAUGUS_LAUNCHER_STATE_DIR, GAMES_JSON, ICONS_DIR, PROTON_CACHYOS
+
+
+def github_api_headers(url):
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token and urllib.parse.urlsplit(url).hostname == "api.github.com":
+        return {"Authorization": f"Bearer {token}"}
+    return {}
 
 
 def umu_game_id(gameid):
@@ -65,6 +73,8 @@ def atomic_write(filepath, write_func):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             write_func(f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, filepath)
     except BaseException:
         if os.path.exists(tmp_path):
